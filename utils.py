@@ -305,7 +305,6 @@ def combine_base_and_metric(base_list, metric_list):
     base_depth_all = []
     base_conf_all = []
     base_intr_all = []
-    base_counts = []
 
     for pred in base_list:
         d = _to_tensor(pred.depth).float()      # [N_b, H, W]
@@ -316,7 +315,6 @@ def combine_base_and_metric(base_list, metric_list):
         base_depth_all.append(d)
         base_conf_all.append(c)
         base_intr_all.append(K)
-        base_counts.append(d.shape[0])
 
     depth_all = torch.cat(base_depth_all, dim=0)   # [Nb_total, H, W]
     conf_all = torch.cat(base_conf_all, dim=0)     # [Nb_total, H, W]
@@ -376,24 +374,17 @@ def combine_base_and_metric(base_list, metric_list):
     valid_metric_depth = metric_scaled[align_mask]
     scale_factor = least_squares_scale_scalar(valid_metric_depth, valid_depth)
 
-    # Apply scale to **all** base frames
-    depth_all = depth_all * scale_factor
-
-    # Scale extrinsics for each batch and write back per-batch depths
+    # Scale depth and extrinsics for each base batch
     scaled_base_list = []
-    offset = 0
-    for pred, count in zip(base_list, base_counts):
-        d = depth_all[offset : offset + count]  # [N_b, H, W]
-        offset += count
-
+    for pred in base_list:
         ext = _to_tensor(pred.extrinsics)
         if ext is not None:
             if ext.ndim != 3 or ext.shape[1:] != (3, 4):
                 raise ValueError(f"Expected extrinsics [N,3,4], got {ext.shape}")
             ext = ext.float()
-            ext[:, :, 3] = ext[:, :, 3] * scale_factor
+            ext[:, :, 3] *= scale_factor
 
-        pred.depth = d
+        pred.depth = _to_tensor(pred.depth) * scale_factor
         if ext is not None:
             pred.extrinsics = ext
         pred.is_metric = 1
