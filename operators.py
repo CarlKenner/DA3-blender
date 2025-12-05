@@ -375,28 +375,21 @@ class GeneratePointCloudOperator(bpy.types.Operator):
             parent_col = collections.new(folder_name)
             scene.collection.children.link(parent_col)
 
-            # Process each batch
-            for i, base_pred in enumerate(aligned_base_predictions):
-                batch_indices = all_base_predictions[i][1]
+            # Combine the base and metric predictions
+            if metric_available:
+                all_combined_predictions = combine_base_and_metric(aligned_base_predictions, aligned_metric_predictions)
+            else:
+                all_combined_predictions = aligned_base_predictions
+
+            # Add a point cloud for each batch
+            for batch_number, batch_prediction in enumerate(all_combined_predictions):
+                batch_indices = all_base_predictions[batch_number][1]
                 batch_paths = [image_paths[j] for j in batch_indices]
                 
-                if metric_available:
-                    metric_pred = aligned_metric_predictions[i]
-                    if metric_mode == "metric_depth":
-                        combined_prediction = combine_base_with_metric_depth(
-                            base_pred, metric_pred
-                        )
-                    else:
-                        combined_prediction = combine_base_and_metric(
-                            base_pred, metric_pred
-                        )
-                else:
-                    combined_prediction = base_pred
-                
-                combined_predictions = convert_prediction_to_dict(combined_prediction, batch_paths)
+                combined_predictions = convert_prediction_to_dict(batch_prediction, batch_paths)
                 
                 # Create batch collection
-                batch_col_name = f"{folder_name}_Batch_{i+1}"
+                batch_col_name = f"{folder_name}_Batch_{batch_number+1}"
                 batch_col = collections.new(batch_col_name)
                 parent_col.children.link(batch_col)
                 
