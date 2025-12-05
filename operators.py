@@ -4,6 +4,7 @@ import os
 import torch
 import numpy as np
 import time
+import datetime
 from .utils import (
     run_model,
     convert_prediction_to_dict,
@@ -20,6 +21,18 @@ def start_progress_timer(total):
     wm = bpy.context.window_manager
     total_predicted_time = total
     wm.progress_begin(0, 100)
+    
+    # Calculate estimated duration and finish time
+    minutes = int(total // 60)
+    seconds = int(total % 60)
+    if minutes > 0:
+        duration_str = f"{minutes} minutes {seconds} seconds"
+    else:
+        duration_str = f"{seconds} seconds"
+    
+    finish_time = datetime.datetime.now() + datetime.timedelta(seconds=total)
+    finish_str = finish_time.strftime("%H:%M:%S")
+    print(f"Estimated duration: {duration_str}, expected finish at {finish_str}")
 
 def update_progress_timer(expected_time, stage=""):
     global wm, total_predicted_time
@@ -272,7 +285,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                         batch_paths = [image_paths[i] for i in batch_indices]
                         print(f"Batch {batch_idx + 1}/{num_batches}:")
                         prediction = run_model(batch_paths, base_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
-                        update_progress_timer(LoadModelTime + end_idx * BatchTimePerImage, f"Base batch {batch_idx + 1}")
+                        update_progress_timer(LoadModelTime + end * BatchTimePerImage, f"Base batch {batch_idx + 1}")
                         print(f"Time to run base batch {batch_idx + 1}: {time.time() - start_time:.2f}s")
                         all_base_predictions.append((prediction, batch_indices.copy()))
 
