@@ -3,6 +3,7 @@ from pathlib import Path
 import os
 import torch
 import numpy as np
+import time
 from .utils import (
     run_model,
     convert_prediction_to_dict,
@@ -160,6 +161,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
         wm = bpy.context.window_manager
         wm.progress_begin(0, 100)
         self.report({'INFO'}, "Starting point cloud generation...")
+        start_time = time.time()
         
         # Get image paths
         import glob
@@ -188,6 +190,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
             base_model = get_model(base_model_name)
             wm.progress_update(15)
             self.report({'INFO'}, "Running base model inference...")
+            print(f"Time to load model: {time.time() - start_time:.2f}s")
             
             all_base_predictions = []
             
@@ -203,6 +206,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                         batch_indices = list(range(start_idx, end_idx))
                         print(f"Batch {batch_idx + 1}/{num_batches}:")
                         prediction = run_model(batch_paths, base_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
+                        print(f"Time to run base batch {batch_idx + 1}: {time.time() - start_time:.2f}s")
                         all_base_predictions.append((prediction, batch_indices))
                 else:
                     # New scheme: (0..9) (0, 9, 10..17) (10, 17, 18..25)
@@ -230,6 +234,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                         batch_paths = [image_paths[i] for i in batch_indices]
                         print(f"Batch {batch_idx + 1}/{num_batches}:")
                         prediction = run_model(batch_paths, base_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
+                        print(f"Time to run base batch {batch_idx + 1}: {time.time() - start_time:.2f}s")
                         all_base_predictions.append((prediction, batch_indices.copy()))
 
                         if remaining_start >= N:
@@ -251,9 +256,11 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                         batch_idx += 1
             else:
                 prediction = run_model(image_paths, base_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
+                print(f"Time to run base batch 1: {time.time() - start_time:.2f}s")
                 all_base_predictions.append((prediction, list(range(len(image_paths)))))
             
             wm.progress_update(60)
+            print(f"Time for base inference: {time.time() - start_time:.2f}s")
 
             # 2) if metric enabled and weights available:
             all_metric_predictions = []
@@ -272,6 +279,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                     metric_model = get_model("da3metric-large")
                     wm.progress_update(75)
                     self.report({'INFO'}, "Running metric model inference...")
+                    print(f"Time to load metric model: {time.time() - start_time:.2f}s")
                     
                     if metric_mode == "scale_base":
                         # In scale_base mode, run **one** metric batch over all images.
@@ -288,6 +296,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                             use_half=use_half_precision,
                             use_ray_pose=use_ray_pose,
                         )
+                        print(f"Time to run metric batch 1: {time.time() - start_time:.2f}s")
                         all_metric_predictions.append((prediction, batch_indices.copy()))
                     else:
                         # For other metric modes, keep previous batching behaviour
@@ -302,6 +311,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                                     batch_indices = list(range(start_idx, end_idx))
                                     print(f"Batch {batch_idx + 1}/{num_batches}:")
                                     prediction = run_model(batch_paths, metric_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
+                                    print(f"Time to run metric batch {batch_idx + 1}: {time.time() - start_time:.2f}s")
                                     all_metric_predictions.append((prediction, batch_indices))
                             else:
                                 N = len(image_paths)
@@ -327,6 +337,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                                     batch_paths = [image_paths[i] for i in batch_indices]
                                     print(f"Batch {batch_idx + 1}/{num_batches}:")
                                     prediction = run_model(batch_paths, metric_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
+                                    print(f"Time to run metric batch {batch_idx + 1}: {time.time() - start_time:.2f}s")
                                     all_metric_predictions.append((prediction, batch_indices.copy()))
 
                                     if remaining_start >= N:
@@ -346,11 +357,13 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                                     batch_idx += 1
                         else:
                             prediction = run_model(image_paths, metric_model, process_res, process_res_method, use_half=use_half_precision, use_ray_pose=use_ray_pose)
+                            print(f"Time to run metric batch 1: {time.time() - start_time:.2f}s")
                             all_metric_predictions.append((prediction, list(range(len(image_paths)))))
                     
                     wm.progress_update(90)
                     metric_model = None
                     unload_current_model()
+                    print(f"Time for metric inference: {time.time() - start_time:.2f}s")
                 else:
                     self.report({'WARNING'}, "Metric model not downloaded; using non-metric depth only.")
             
@@ -365,6 +378,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                 aligned_base_predictions = [p[0] for p in all_base_predictions]
                 if metric_available:
                     aligned_metric_predictions = [p[0] for p in all_metric_predictions]
+            print(f"Time to align batches: {time.time() - start_time:.2f}s")
 
             # Create or get a collection named after the folder
             folder_name = os.path.basename(os.path.normpath(input_folder))
@@ -380,6 +394,7 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                 all_combined_predictions = combine_base_and_metric(aligned_base_predictions, aligned_metric_predictions)
             else:
                 all_combined_predictions = aligned_base_predictions
+            print(f"Time to combine predictions: {time.time() - start_time:.2f}s")
 
             # Add a point cloud for each batch
             for batch_number, batch_prediction in enumerate(all_combined_predictions):
@@ -395,8 +410,11 @@ class GeneratePointCloudOperator(bpy.types.Operator):
                 
                 import_point_cloud(combined_predictions, collection=batch_col)
                 create_cameras(combined_predictions, collection=batch_col)
+                print(f"Time to add batch {batch_number + 1} to Blender: {time.time() - start_time:.2f}s")
             
             self.report({'INFO'}, "Point cloud generation complete.")
+            print(f"Time for post-processing: {time.time() - start_time:.2f}s")
+            print(f"Total time: {time.time() - start_time:.2f}s")
             wm.progress_update(100)
             wm.progress_end()
             
