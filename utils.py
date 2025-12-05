@@ -7,7 +7,6 @@ import math
 import torch
 
 from depth_anything_3.utils.alignment import (
-    apply_metric_scaling,
     compute_alignment_mask,
     compute_sky_mask,
     least_squares_scale_scalar,
@@ -277,129 +276,115 @@ def convert_prediction_to_dict(prediction, image_paths=None):
     predictions["world_points_from_depth"] = world_points
     return predictions
 
-# Based on da3_repo/src/depth_anything_3/model/da3.py, adapted to operate on
-# lists of batch predictions and 4D tensors [B, N, H, W].
+# Based on da3_repo/src/depth_anything_3/model/da3.py
 def combine_base_and_metric(base_list, metric_list):
     """Combine base predictions (with poses) with metric predictions (no poses).
 
+    This version operates purely on [N, H, W] tensors per batch and
+    re-implements the metric scaling logic from DA3 so that batches may
+    have different sizes (e.g. a shorter last batch).
+
     Args:
         base_list:   list of base `Prediction` objects (one per batch), each with
-                 depth [N_b, H, W], conf [N_b, H, W], intrinsics [N_b, 3, 3],
-                 extrinsics [N_b, 3, 4].
+                     depth [N_b, H, W], conf [N_b, H, W], intrinsics [N_b, 3, 3],
+                     extrinsics [N_b, 3, 4].
         metric_list: list of metric `Prediction` objects (one per batch), each with
                      depth [N_m, H, W], sky [N_m, H, W]. For scale_base you typically
-                     pass a single-element list and let B_metric <= B_base.
+                     pass a single-element list and let total metric frames
+                     be <= total base frames.
 
     Returns:
         List of base `Prediction` objects (same length as base_list) whose
         depths and extrinsics have been globally scaled to metric units.
-
-    Notes:
-        - A single global scale factor is estimated using ALL overlapping
-          frames across the given batches.
-        - Metric may contain fewer total frames than base; only overlapping
-          indices contribute to the least-squares scale.
-        - Sky handling (push sky to a far depth) is applied only over frames
-          that exist in the metric predictions.
     """
 
     if not base_list:
         return []
 
-    # Collect per-batch tensors and ensure consistent per-batch frame counts
-    base_depths = []   # each [N, H, W]
-    base_confs = []    # each [N, H, W]
-    base_intrinsics = []  # each [N, 3, 3]
-
-    metric_depths = []  # each [N_m, H, W]
-    metric_skies = []   # each [N_m, H, W]
-
+    # Concatenate all base frames into a single [Nb_total, H, W]
+    base_depth_all = []
+    base_conf_all = []
+    base_intr_all = []
     base_counts = []
-    metric_counts = []
 
     for pred in base_list:
-        d = _to_tensor(pred.depth).float()
-        c = _to_tensor(pred.conf).float()
-        K = _to_tensor(pred.intrinsics).float()
+        d = _to_tensor(pred.depth).float()      # [N_b, H, W]
+        c = _to_tensor(pred.conf).float()       # [N_b, H, W]
+        K = _to_tensor(pred.intrinsics).float() # [N_b, 3, 3]
         if d.ndim != 3 or c.ndim != 3:
             raise ValueError(f"Base depth/conf must be [N,H,W], got depth={d.shape}, conf={c.shape}")
-        base_depths.append(d)
-        base_confs.append(c)
-        base_intrinsics.append(K)
+        base_depth_all.append(d)
+        base_conf_all.append(c)
+        base_intr_all.append(K)
         base_counts.append(d.shape[0])
 
+    depth_all = torch.cat(base_depth_all, dim=0)   # [Nb_total, H, W]
+    conf_all = torch.cat(base_conf_all, dim=0)     # [Nb_total, H, W]
+    intr_all = torch.cat(base_intr_all, dim=0)     # [Nb_total, 3, 3]
+
+    # Concatenate all metric frames similarly
+    metric_depth_all = []
+    sky_all = []
     for pred in metric_list:
-        md = _to_tensor(pred.depth).float()
-        sky = _to_tensor(pred.sky).float()
+        md = _to_tensor(pred.depth).float()   # [Nm, H, W]
+        sky = _to_tensor(pred.sky).float()    # [Nm, H, W]
         if md.ndim != 3 or sky.ndim != 3:
             raise ValueError(f"Metric depth/sky must be [N,H,W], got depth={md.shape}, sky={sky.shape}")
-        metric_depths.append(md)
-        metric_skies.append(sky)
-        metric_counts.append(md.shape[0])
+        metric_depth_all.append(md)
+        sky_all.append(sky)
 
-    if not metric_depths:
+    if not metric_depth_all:
         raise ValueError("Metric prediction list is empty or missing required fields")
 
-    # We require a single uniform N across batches to build [B, N, H, W]
-    unique_base_N = set(b.shape[0] for b in base_depths)
-    unique_metric_N = set(m.shape[0] for m in metric_depths)
-    if len(unique_base_N) != 1:
-        raise ValueError(f"All base batches must have same N, got {unique_base_N}")
-    if len(unique_metric_N) != 1:
-        raise ValueError(f"All metric batches must have same N, got {unique_metric_N}")
+    metric_all = torch.cat(metric_depth_all, dim=0)   # [Nm_total, H, W]
+    sky_all = torch.cat(sky_all, dim=0)               # [Nm_total, H, W]
 
-    N_base = unique_base_N.pop()
-    N_metric = unique_metric_N.pop()
+    Nb_total = depth_all.shape[0]
+    Nm_total = metric_all.shape[0]
 
-    B_base = len(base_depths)
-    B_metric = len(metric_depths)
+    # Restrict to overlapping frames in the sequence sense
+    N_overlap = min(Nb_total, Nm_total)
+    if N_overlap <= 0:
+        raise ValueError("Metric prediction has no frames; cannot compute scale.")
 
-    # Stack into true 4D [B, N, H, W] tensors
-    depth_all = torch.stack(base_depths, dim=0)      # [B_base, N_base, H, W]
-    conf_all = torch.stack(base_confs, dim=0)        # [B_base, N_base, H, W]
-    intr_all = torch.stack(base_intrinsics, dim=0)   # [B_base, N_base, 3, 3]
+    depth_overlap = depth_all[:N_overlap]        # [N_overlap, H, W]
+    metric_overlap = metric_all[:N_overlap]      # [N_overlap, H, W]
+    sky_overlap = sky_all[:N_overlap]            # [N_overlap, H, W]
+    ixt_overlap = intr_all[:N_overlap]           # [N_overlap, 3, 3]
 
-    metric_depth_all = torch.stack(metric_depths, dim=0)   # [B_metric, N_metric, H, W]
-    sky_all = torch.stack(metric_skies, dim=0)             # [B_metric, N_metric, H, W]
+    # Inline metric scaling logic from DA3's apply_metric_scaling for [N, H, W]
+    # focal_length = (fx + fy) / 2, depth_scaled = depth * (f / scale_factor)
+    scale_factor_metric = 300.0
+    focal_length = (ixt_overlap[:, 0, 0] + ixt_overlap[:, 1, 1]) / 2.0   # [N_overlap]
+    metric_scaled = metric_overlap * (focal_length[:, None, None] / scale_factor_metric)
 
-    # Restrict metric-based scaling to overlapping batches [0 .. B_overlap-1]
-    B_overlap = min(B_base, B_metric)
-    if B_overlap <= 0:
-        raise ValueError("Metric prediction has no batches; cannot compute scale.")
-
-    depth_overlap = depth_all[:B_overlap]           # [B_overlap, N_base, H, W]
-    metric_overlap = metric_depth_all[:B_overlap]   # [B_overlap, N_metric, H, W]
-    sky_overlap = sky_all[:B_overlap]               # [B_overlap, N_metric, H, W]
-    ixt_overlap = intr_all[:B_overlap]              # [B_overlap, N_base, 3, 3]
-
-    # apply_metric_scaling expects [B, N, H, W] depth and [B, N, 3, 3] intrinsics
-    metric_scaled = apply_metric_scaling(metric_overlap, ixt_overlap)
-
-    # Non-sky mask and alignment only on overlapping batches
-    non_sky_mask = compute_sky_mask(sky_overlap, threshold=0.3)  # [B_overlap, N_metric, H, W]
+    # Non-sky mask and alignment only on overlapping frames
+    non_sky_mask = compute_sky_mask(sky_overlap, threshold=0.3)  # [N_overlap, H, W]
     if non_sky_mask.sum() <= 10:
         raise ValueError("Insufficient non-sky pixels for alignment")
 
-    depth_conf_overlap = conf_all[:B_overlap]   # [B_overlap, N_base, H, W]
+    depth_conf_overlap = conf_all[:N_overlap]   # [N_overlap, H, W]
     depth_conf_ns = depth_conf_overlap[non_sky_mask]
     depth_conf_sampled = sample_tensor_for_quantile(depth_conf_ns, max_samples=100000)
     median_conf = torch.quantile(depth_conf_sampled, 0.5)
 
     align_mask = compute_alignment_mask(
-        depth_conf_overlap, non_sky_mask, depth_overlap, metric_overlap, median_conf
+        depth_conf_overlap, non_sky_mask, depth_overlap, metric_scaled, median_conf
     )
 
     valid_depth = depth_overlap[align_mask]
     valid_metric_depth = metric_scaled[align_mask]
     scale_factor = least_squares_scale_scalar(valid_metric_depth, valid_depth)
 
-    # Apply scale to **all** base batches/frames
+    # Apply scale to **all** base frames
     depth_all = depth_all * scale_factor
 
-    # Scale extrinsics in each base prediction individually, preserving per-batch grouping
+    # Scale extrinsics for each batch and write back per-batch depths
     scaled_base_list = []
-    for b_idx, pred in enumerate(base_list):
-        d = depth_all[b_idx]  # [N_base, H, W]
+    offset = 0
+    for pred, count in zip(base_list, base_counts):
+        d = depth_all[offset : offset + count]  # [N_b, H, W]
+        offset += count
 
         ext = _to_tensor(pred.extrinsics)
         if ext is not None:
@@ -426,11 +411,11 @@ def combine_base_with_metric_depth(base, metric):
     logic as `combine_base_and_metric`.
 
     Assumes shapes:
-      - base.depth:        [B, H, W]
-      - metric.depth:      [B, H, W]
-      - base.intrinsics:   [B, 3, 3]
-    - base.extrinsics:   [N, 3, 4]
-      - metric.sky:        [B, H, W]
+      - base.depth:        [N, H, W]
+      - metric.depth:      [N, H, W]
+      - base.intrinsics:   [N, 3, 3]
+      - base.extrinsics:   [N, 3, 4]
+      - metric.sky:        [N, H, W]
     """
     output = base
 
