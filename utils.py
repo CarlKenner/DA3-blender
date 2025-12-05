@@ -415,31 +415,6 @@ def combine_base_and_metric(base_list, metric_list):
         pred.scale_factor = float(scale_factor.item())
         scaled_base_list.append(pred)
 
-    # Sky handling: only over batches where metric exists.
-    # We only modify depths of the batches/frames that have metric sky.
-    non_sky_depth = depth_all[:B_metric][compute_sky_mask(sky_all, threshold=0.3)]
-    if non_sky_depth.numel() > 100000:
-        idx = torch.randint(0, non_sky_depth.numel(), (100000,), device=non_sky_depth.device)
-        sampled_depth = non_sky_depth[idx]
-    else:
-        sampled_depth = non_sky_depth
-
-    non_sky_max = torch.quantile(sampled_depth, 0.99)
-    non_sky_max = torch.minimum(non_sky_max, torch.tensor(200.0, device=depth_all.device))
-
-    # depth_all is already [B_base, N_base, H, W]; sky_all is [B_metric, N_metric, H, W]
-    depth_4d_full = depth_all
-    dummy_conf = torch.ones_like(depth_4d_full)
-    full_non_sky_mask = compute_sky_mask(sky_all, threshold=0.3)
-    depth_4d_full, _ = set_sky_regions_to_max_depth(
-        depth_4d_full, dummy_conf, full_non_sky_mask, max_depth=non_sky_max
-    )
-    depth_all = depth_4d_full
-
-    # Write back sky-handled depths into per-batch predictions
-    for b_idx, pred in enumerate(scaled_base_list):
-        pred.depth = depth_all[b_idx]
-
     return scaled_base_list
 
 
