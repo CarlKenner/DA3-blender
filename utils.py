@@ -279,128 +279,113 @@ def convert_prediction_to_dict(prediction, image_paths=None):
 
 # Based on da3_repo/src/depth_anything_3/model/da3.py, simplified for this addon
 def combine_base_and_metric(base, metric):
-    """
-    Combine a base DA3 prediction (with camera poses) and a metric DA3 prediction (no poses)
-    to produce a metric-scaled depth and adjusted extrinsics.
+    """Combine base prediction (with poses) with metric prediction (no poses).
 
-    Assumes shapes:
-      - base.depth:        [B, H, W]
-      - metric.depth:      [B, H, W]
-      - base.intrinsics:   [B, 3, 3]
-      - base.extrinsics:   [N, 3, 4] or [B, N, 4, 4]
-      - metric.sky:        [B, H, W]
-    depth_conf is optional and ignored for scaling.
+    - Always scales the **entire** base output (depth + extrinsics).
+    - Metric may contain fewer frames than base; the scale is computed
+      only from overlapping frames.
+    - Sky handling (setting sky to far depth) is applied **only** when
+      the metric sequence length matches the base sequence length.
     """
     output = base  # work in-place on base prediction
 
     # Pull relevant fields
-    depth = output.depth          # [B, H, W] (torch or numpy)
-    metric_depth = metric.depth   # [B, H, W]
-    intrinsics = output.intrinsics  # [B, 3, 3]
-    sky = metric.sky              # [B, H, W]
+    depth = output.depth          # [B_base, H, W]
+    metric_depth = metric.depth   # [B_metric, H, W]
+    intrinsics = output.intrinsics  # [B_base, 3, 3]
+    sky = metric.sky              # [B_metric, H, W]
 
-    depth = _to_tensor(depth)
-    metric_depth = _to_tensor(metric_depth)
-    intrinsics = _to_tensor(intrinsics)
-    sky = _to_tensor(sky)
+    depth = _to_tensor(depth).float()
+    metric_depth = _to_tensor(metric_depth).float()
+    intrinsics = _to_tensor(intrinsics).float()
+    sky = _to_tensor(sky).float()
 
-    # Ensure everything is float
-    depth = depth.float()
-    metric_depth = metric_depth.float()
-    intrinsics = intrinsics.float()
-    sky = sky.float()
+    B_base = depth.shape[0]
+    B_metric = metric_depth.shape[0]
+    if depth.ndim != 3 or metric_depth.ndim != 3:
+        raise ValueError(f"Unexpected depth shapes: base={depth.shape}, metric={metric_depth.shape}")
 
-    # Add channel dim so depth/metric_depth become [B, 1, H, W]
-    if depth.ndim == 3:
-        depth_4d = depth.unsqueeze(1)
-    else:
-        raise ValueError(f"Unexpected depth shape: {depth.shape}")
+    # Restrict metric-based scaling to overlapping frames [0 .. B_overlap-1]
+    B_overlap = min(B_base, B_metric)
+    if B_overlap <= 0:
+        raise ValueError("Metric prediction has no frames; cannot compute scale.")
 
-    if metric_depth.ndim == 3:
-        metric_4d = metric_depth.unsqueeze(1)
-    else:
-        raise ValueError(f"Unexpected metric_depth shape: {metric_depth.shape}")
+    depth_overlap = depth[:B_overlap]           # [B_overlap, H, W]
+    metric_overlap = metric_depth[:B_overlap]   # [B_overlap, H, W]
+    sky_overlap = sky[:B_overlap]               # [B_overlap, H, W]
 
-    # Metric scaling: intrinsics must be (B, N, 3, 3)
-    # Here N=1 (single view per batch entry), so we add that dim.
-    ixt = intrinsics  # [B, 3, 3]
-    if ixt.ndim == 3:
-        ixt_4d = ixt.unsqueeze(1)  # [B, 1, 3, 3]
-    else:
+    # Metric scaling: intrinsics must be (B, N, 3, 3); N=1 here
+    ixt_overlap = intrinsics[:B_overlap]        # [B_overlap, 3, 3]
+    if ixt_overlap.ndim != 3:
         raise ValueError(f"Unexpected intrinsics shape: {intrinsics.shape}")
 
-    metric_4d = apply_metric_scaling(metric_4d, ixt_4d)  # [B, 1, H, W] (scaled metric depth)
+    depth_4d = depth_overlap.unsqueeze(1)        # [B_overlap, 1, H, W]
+    metric_4d = metric_overlap.unsqueeze(1)      # [B_overlap, 1, H, W]
+    ixt_4d = ixt_overlap.unsqueeze(1)           # [B_overlap, 1, 3, 3]
 
-    # Back to [B, H, W]
-    depth = depth_4d.squeeze(1)
-    metric_depth = metric_4d.squeeze(1)
+    metric_4d = apply_metric_scaling(metric_4d, ixt_4d)  # scaled metric depth
+    metric_overlap = metric_4d.squeeze(1)      # [B_overlap, H, W]
 
-    # Non-sky mask: [B, H, W]
-    non_sky_mask = compute_sky_mask(sky, threshold=0.3)
-    assert non_sky_mask.sum() > 10, "Insufficient non-sky pixels for alignment"
+    # Non-sky mask and alignment only on overlapping frames
+    non_sky_mask = compute_sky_mask(sky_overlap, threshold=0.3)  # [B_overlap, H, W]
+    if non_sky_mask.sum() <= 10:
+        raise ValueError("Insufficient non-sky pixels for alignment")
 
-    # Align using compute_alignment_mask logic from da3.py
-    # output.conf is the depth confidence - convert to tensor if needed
-    depth_conf = _to_tensor(output.conf).float()
-    
-    # Sample depth confidence for quantile computation
-    depth_conf_ns = depth_conf[non_sky_mask]
+    # Depth confidence tensor from base prediction
+    depth_conf = _to_tensor(output.conf).float()   # [B_base, H, W]
+    depth_conf_overlap = depth_conf[:B_overlap]    # [B_overlap, H, W]
+
+    depth_conf_ns = depth_conf_overlap[non_sky_mask]
     depth_conf_sampled = sample_tensor_for_quantile(depth_conf_ns, max_samples=100000)
     median_conf = torch.quantile(depth_conf_sampled, 0.5)
 
-    # Compute alignment mask
     align_mask = compute_alignment_mask(
-        depth_conf, non_sky_mask, depth, metric_depth, median_conf
+        depth_conf_overlap, non_sky_mask, depth_overlap, metric_overlap, median_conf
     )
 
-    # Compute scale factor using least squares on aligned pixels
-    valid_depth = depth[align_mask]
-    valid_metric_depth = metric_depth[align_mask]
-
+    valid_depth = depth_overlap[align_mask]
+    valid_metric_depth = metric_overlap[align_mask]
     scale_factor = least_squares_scale_scalar(valid_metric_depth, valid_depth)
 
-    # Apply scale to depth
+    # Apply scale to **all** base frames
     depth = depth * scale_factor
 
-    # Scale extrinsics translation
     extrinsics = _to_tensor(output.extrinsics)
     print("DEBUG combine_base_and_metric: extrinsics shape:", extrinsics.shape)
 
     if extrinsics.ndim == 3:
-        # [N, 3, 4]: scale translation column
         extrinsics = extrinsics.float()
         extrinsics[:, :, 3] = extrinsics[:, :, 3] * scale_factor
     elif extrinsics.ndim == 4:
-        # [B, N, 4, 4]
         extrinsics = extrinsics.float()
         extrinsics[:, :, :3, 3] = extrinsics[:, :, :3, 3] * scale_factor
     else:
         raise ValueError(f"Unexpected extrinsics shape: {extrinsics.shape}")
 
-    # Optional: handle sky regions roughly like nested model (set sky to far depth)
-    non_sky_depth = depth[non_sky_mask]
-    if non_sky_depth.numel() > 100000:
-        idx = torch.randint(0, non_sky_depth.numel(), (100000,), device=non_sky_depth.device)
-        sampled_depth = non_sky_depth[idx]
-    else:
-        sampled_depth = non_sky_depth
+    # Optional sky handling: only if lengths match exactly
+    if B_base == B_metric:
+        non_sky_depth = depth[compute_sky_mask(sky, threshold=0.3)]
+        if non_sky_depth.numel() > 100000:
+            idx = torch.randint(0, non_sky_depth.numel(), (100000,), device=non_sky_depth.device)
+            sampled_depth = non_sky_depth[idx]
+        else:
+            sampled_depth = non_sky_depth
 
-    non_sky_max = torch.quantile(sampled_depth, 0.99)
-    non_sky_max = torch.minimum(non_sky_max, torch.tensor(200.0, device=depth.device))
+        non_sky_max = torch.quantile(sampled_depth, 0.99)
+        non_sky_max = torch.minimum(non_sky_max, torch.tensor(200.0, device=depth.device))
 
-    # We don't have depth_conf; use a dummy one and ignore it after
-    depth_4d = depth.unsqueeze(1)
-    dummy_conf = torch.ones_like(depth_4d)
-    depth_4d, _ = set_sky_regions_to_max_depth(
-        depth_4d, dummy_conf, non_sky_mask.unsqueeze(1), max_depth=non_sky_max
-    )
-    depth = depth_4d.squeeze(1)
+        depth_4d_full = depth.unsqueeze(1)
+        dummy_conf = torch.ones_like(depth_4d_full)
+        full_non_sky_mask = compute_sky_mask(sky, threshold=0.3).unsqueeze(1)
+        depth_4d_full, _ = set_sky_regions_to_max_depth(
+            depth_4d_full, dummy_conf, full_non_sky_mask, max_depth=non_sky_max
+        )
+        depth = depth_4d_full.squeeze(1)
 
     # Write back into output prediction
     output.depth = depth
     output.extrinsics = extrinsics
     output.is_metric = 1
-    # least_squares_scale_scalar returns a scalar tensor
     output.scale_factor = float(scale_factor.item())
 
     return output
