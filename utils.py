@@ -284,8 +284,8 @@ def combine_base_and_metric(base_list, metric_list):
 
     Args:
         base_list:   list of base `Prediction` objects (one per batch), each with
-                     depth [N_b, H, W], conf [N_b, H, W], intrinsics [N_b, 3, 3],
-                     extrinsics [N_b, 3, 4] or [N_b, N_cam, 4, 4].
+                 depth [N_b, H, W], conf [N_b, H, W], intrinsics [N_b, 3, 3],
+                 extrinsics [N_b, 3, 4].
         metric_list: list of metric `Prediction` objects (one per batch), each with
                      depth [N_m, H, W], sky [N_m, H, W]. For scale_base you typically
                      pass a single-element list and let B_metric <= B_base.
@@ -403,14 +403,10 @@ def combine_base_and_metric(base_list, metric_list):
 
         ext = _to_tensor(pred.extrinsics)
         if ext is not None:
-            if ext.ndim == 3:
-                ext = ext.float()
-                ext[:, :, 3] = ext[:, :, 3] * scale_factor
-            elif ext.ndim == 4:
-                ext = ext.float()
-                ext[:, :, :3, 3] = ext[:, :, :3, 3] * scale_factor
-            else:
-                raise ValueError(f"Unexpected extrinsics shape: {ext.shape}")
+            if ext.ndim != 3 or ext.shape[1:] != (3, 4):
+                raise ValueError(f"Expected extrinsics [N,3,4], got {ext.shape}")
+            ext = ext.float()
+            ext[:, :, 3] = ext[:, :, 3] * scale_factor
 
         pred.depth = d
         if ext is not None:
@@ -458,7 +454,7 @@ def combine_base_with_metric_depth(base, metric):
       - base.depth:        [B, H, W]
       - metric.depth:      [B, H, W]
       - base.intrinsics:   [B, 3, 3]
-      - base.extrinsics:   [N, 3, 4] or [B, N, 4, 4]
+    - base.extrinsics:   [N, 3, 4]
       - metric.sky:        [B, H, W]
     """
     output = base
@@ -518,14 +514,11 @@ def combine_base_with_metric_depth(base, metric):
     extrinsics = _to_tensor(output.extrinsics)
     print("DEBUG combine_base_with_metric_depth: extrinsics shape:", extrinsics.shape)
 
-    if extrinsics.ndim == 3:
-        extrinsics = extrinsics.float()
-        extrinsics[:, :, 3] = extrinsics[:, :, 3] * scale_factor
-    elif extrinsics.ndim == 4:
-        extrinsics = extrinsics.float()
-        extrinsics[:, :, :3, 3] = extrinsics[:, :, :3, 3] * scale_factor
-    else:
-        raise ValueError(f"Unexpected extrinsics shape: {extrinsics.shape}")
+    if extrinsics.ndim != 3 or extrinsics.shape[1:] != (3, 4):
+        raise ValueError(f"Expected extrinsics [N,3,4], got {extrinsics.shape}")
+
+    extrinsics = extrinsics.float()
+    extrinsics[:, :, 3] = extrinsics[:, :, 3] * scale_factor
 
     # Write back into output: metric depth + scaled base cameras
     output.depth = depth
